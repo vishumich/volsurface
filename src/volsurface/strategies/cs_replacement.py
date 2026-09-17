@@ -137,12 +137,17 @@ def _futures_benchmark(surface, dates, p: Params):
     rows, daily = [], pd.Series(0.0, index=dates)
     T = p.tenor_days / 365.0
     for i, d in enumerate(dates):
-        end_i = min(i + p.tenor_days, len(dates) - 1)
-        if end_i <= i:
+        # CALENDAR days to maturity, not `i + tenor_days` rows of the business
+        # index. The row-offset version held ~42 calendar days instead of 30,
+        # so ~30 trades were live at once instead of ~21 and the benchmark ran
+        # at 1.40x rather than 1x - which is most of why its drawdown came in
+        # at -49% against SPX's own -34%. Same bug class as the one fixed in
+        # engine.run_trade; this path did not share that code.
+        seg = dates[(dates >= d) & (dates <= d + pd.Timedelta(days=int(p.tenor_days)))]
+        if len(seg) < 2:
             continue
         F0 = surface.forward(d, T)
         units = p.daily_notional / F0
-        seg = dates[i : end_i + 1]
         fwd = pd.Series({x: surface.forward(x, max(T - (x - d).days / 365.0, 1e-8)) for x in seg})
         inc = fwd.diff().fillna(0.0) * units
         daily = daily.add(inc.reindex(dates).fillna(0.0), fill_value=0.0)

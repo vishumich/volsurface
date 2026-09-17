@@ -12,7 +12,7 @@ are most likely to break.
 
 ```bash
 pip install -e .
-pytest                       # 11 unit tests, no vendor data needed
+pytest                       # 34 unit tests, no vendor data needed
 python scripts/run_smoke.py  # end-to-end on a synthetic surface
 ```
 
@@ -30,8 +30,14 @@ python scripts/run_smoke.py  # end-to-end on a synthetic surface
 | Index dividend yield | OptionMetrics `idxdvd` | `date, rate` | Forwards. Flat 1.5% is an acceptable v1. |
 | VIX close | CBOE / Bloomberg | `date, close` | Regime cutoffs. Only needed for the VIX-sizing variants. |
 
-Coverage needed: **2017-01 to present** matches the paper's window. Push back to 2007 if you want
-the 2008 sample, which the report only reaches for the post-crash strategy.
+Coverage needed: **2017-01 to present** matches the paper's window.
+
+**In practice none of the above needs a WRDS pull.** Saba runs an on-prem OptionMetrics **IvyDB-US**
+SQL Server, refreshed daily and covering 122,398 securities back to **1996-01-04** - so the 2008
+sample, the dot-com unwind and LTCM are all in reach, not just 2017. `src/volsurface/ivydb.py` has
+the loaders. Note IvyDB's column names are NOT the WRDS spellings quoted in the tables above
+(`securityid`/`bestbid`/`bestoffer`/`expiration`/`callput`), and prefer its published
+`forward_price` curve to reconstructing `S*exp((r-q)T)`.
 
 ### Preferred (materially better fidelity)
 
@@ -44,13 +50,70 @@ edge. If the base result survives, re-run on:
 | Full SPX option chain, EOD | OptionMetrics `opprcd` (`best_bid`, `best_offer`, `volume`, `open_interest`) | Real bid-ask instead of an assumed half-spread; lets you drop strikes with no quoted size. |
 | 10DTE listing calendar | OPRA / CBOE | 10DTE means a real listed expiry. Pre-2022 the weekly grid is sparser, and assuming a 10-day option always exists back-fills liquidity that wasn't there. |
 
-`OptionMetricsSurface` in `src/volsurface/data.py` takes the standardised file. Wire the chain
-version as a second adapter behind the same `VolSurface` protocol; nothing downstream changes.
+Both are now implemented — see **The chain adapter** below. `opprcd` is the only extra pull needed;
+the listing calendar comes free with it, since a chain only contains expiries that were listed.
 
 ### Not needed
 Nothing intraday for these two. Idea #7 (SOXX momentum) needs minute bars; that's a separate branch.
 
 ---
+
+## The chain adapter
+
+`src/volsurface/chain.py` reads the raw chain behind the same `VolSurface` protocol, so strategies
+and the sensitivity harness are unchanged. Three things stop being assumptions.
+
+**1. Cost is measured, not guessed.** `Costs.vol_points` is one number standing in for a spread
+that is constant neither across the surface nor through time. Measured on real SPX quotes
+(2022-01-03 to 2026-09-14, 6.66M surviving quotes):
+
+| delta bucket | median half-spread | p90 | median (ask−bid)/mid |
+|---|---|---|---|
+| 0–5 | **0.18 vol pts** | **0.84** | 13.3% |
+| 5–10 | 0.08 | 0.13 | 3.6% |
+| 10–25 | 0.06 | 0.11 | 2.0% |
+| 25–50 | 0.06 | 0.11 | 1.1% |
+
+The 0.25 default is *conservative* at the median and far too generous in the tail: at 5 delta the
+median is 0.18 but the p90 is 0.84. The distribution's tail is the risk, not its centre — wing
+spreads widen precisely when a short-wing book would want to stop selling, and a constant charge
+cannot express that. Use `spread_profile()` on your own window rather than trusting either number.
+
+**2. Strikes are listed strikes.** `strike_for_delta` snaps to the nearest quoted strike instead of
+solving for a continuous one, and `TradeResult.entry_delta` reports what you actually got. On real
+SPX the selection is tight: a "5-delta" book comes in at a mean 0.0503 delta over 1,172 trades. Ask for a
+delta nothing is listed near and the day is skipped, not approximated — `Structure.max_delta_error`.
+
+**3. Expiries are listed expiries.** `resolve_tenor` snaps to a real expiry and returns its true DTE,
+which the engine then carries through the mark and the holding period. On real SPX a "10DTE" book
+averages 9.92 days, and only 1 of 1,173 entry dates had no usable listing. Set `Structure.tenor_tolerance_days` to skip days when nothing was listed near the target
+rather than silently trading a 17-day option as if it were a 10-day one — this is the control that
+stops a pre-2022 backtest inventing a weekly grid.
+
+```python
+from volsurface import chain, engine
+from volsurface.engine import Costs
+
+cs = chain.OptionChainSurface(
+    chain.normalize_optionmetrics(opprcd),      # handles strike_price / 1000
+    prices, rates=zerocd, divs=idxdvd,
+    filters=chain.ChainFilters.liquid(),        # OI >= 100, real two-sided markets
+)
+print(cs.spread_profile())                      # what do we actually pay?
+
+engine.use_costs(Costs(spot_bps=0.5))           # quoted spreads, since cs can quote
+engine.use_costs(Costs.assumed(0.25, 0.5))      # force the flat model, for comparison
+engine.use_costs(Costs.zero())                  # off everywhere, to reproduce the paper
+```
+
+`sensitivity.quoted_cost_ladder` replaces `cost_ladder` once quotes are real: the open question is
+no longer "at what assumed bid-ask does this die" but "how much of the quoted spread do you have to
+avoid paying". Needing `spread_mult < 0.5` means claiming better-than-mid fills on a daily roll of
+thousands of wing contracts — a claim about the desk, not about the surface.
+
+`make_synthetic_chain` builds a listed chain off any surface (fixed strike ladder, weeklies then
+third-Friday monthlies, tick-rounded quotes that widen into the wings) so all of this runs in tests
+with no vendor data.
 
 ## Testing order
 
@@ -66,6 +129,15 @@ the surface, not at a flat vol (`test_strike_from_delta_uses_surface_not_flat_vo
 half-spread from 0 to 1.0 vol points. Idea #1 enters daily at 5 delta and hedges daily; the
 question is whether it survives 0.25 vol, not whether it works at zero. Do this *before*
 enhancements so you're not tuning overlays to rescue a strategy that costs already killed.
+
+**2b. Re-run step 2 on the chain.** `cost_ladder` sweeps an assumption; once `opprcd` is loaded the
+spread is a measurement, so switch to `sensitivity.quoted_cost_ladder` and read
+`cs.spread_profile()` first. On SPX 2022-2026 the 5-delta median came in at 0.18 vol points, BELOW
+the 0.25 default, with a p90 of 0.84 - so the assumption is conservative typically and generous in
+the tail, and it is the tail that matters. If Idea #1 needs `spread_mult` below 0.5 it needs
+better-than-mid fills every day at 5 delta, and the conversation moves to the execution desk. Check the skip rate here too: a large
+count of days with no listed 10DTE expiry, or no strike within `max_delta_error` of 5 delta, means
+the earlier standardised-surface run was trading options that did not exist.
 
 **3. Add overlays one at a time and attribute.** `build(..., overlays=True)` returns per-leg P&L.
 The claim is 0.91 → 1.23. Check which leg delivers it. If the whole increment is the earnings
@@ -104,7 +176,9 @@ construction, it isn't a vol-surface result.
 - `max_drawdown(daily, capital)` divides by a **capital base you supply**. For a daily-entry
   overlapping book, pass peak deployed notional, not $1mm, or the figure will exceed 100%.
 - Costs are **on by default** (`Costs(vol_points=0.25, spot_bps=0.5)`). `Costs.zero()` reproduces
-  the paper.
+  the paper. On a surface that can quote (`chain.OptionChainSurface`) the **real half-spread is
+  charged and `vol_points` is ignored**; `Costs.assumed(...)` forces the flat model back on for an
+  apples-to-apples comparison.
 
 ## Known limitations
 
@@ -116,6 +190,14 @@ construction, it isn't a vol-surface result.
 - No early-exercise handling. Fine for SPX (European), wrong for single names — do not reuse this
   engine for the Mag 7 ideas (#4) without adding it.
 - Interest rates and dividends default to flat. Immaterial for 10DTE, starts to matter at 1Y.
+- The chain adapter marks off the **OTM mid** at each listed strike. It models no size: crossing
+  the quoted half-spread is assumed to fill the whole clip, which for a daily 5-delta roll at real
+  size is optimistic. Depth is the next thing to model, and `open_interest` is already carried on
+  every `Quote` to do it with.
+- `make_synthetic_chain` is a fixture, not a market, and it is **not calibrated**: tick rounding
+  makes its wing spreads ~4x too wide (a $0.05 tick is 14% of a $0.35 synthetic option; the real
+  8DTE 5-delta SPX call trades ~$2.40 on a $0.10 market). Use it to exercise code paths, never to
+  size a cost assumption.
 
 ## Source
 
