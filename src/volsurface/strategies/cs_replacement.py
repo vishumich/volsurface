@@ -152,7 +152,8 @@ def _futures_benchmark(surface, dates, p: Params):
         inc = fwd.diff().fillna(0.0) * units
         daily = daily.add(inc.reindex(dates).fillna(0.0), fill_value=0.0)
         rows.append({"entry": d, "exit": seg[-1], "label": "futures",
-                     "pnl": float(inc.sum()), "cost": 0.0})
+                     "pnl": float(inc.sum()), "cost": 0.0,
+                     "notional": float(p.daily_notional)})
     return pd.DataFrame(rows), daily, []
 
 
@@ -163,7 +164,8 @@ def _as_frame(results):
         [
             {"entry": r.entry, "exit": r.exit, "label": r.label, "pnl": r.pnl,
              "option_pnl": r.option_pnl, "hedge_pnl": r.hedge_pnl, "cost": r.cost,
-             "entry_premium": r.entry_premium, "scale": r.scale}
+             "entry_premium": r.entry_premium, "scale": r.scale,
+             "notional": r.notional}
             for r in results
         ]
     )

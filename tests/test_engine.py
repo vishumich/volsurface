@@ -116,3 +116,59 @@ def test_earnings_window_covers_five_weeks():
 def test_max_drawdown_sign_and_scale():
     pnl = pd.Series([1.0, -5.0, 1.0, 1.0])
     assert metrics.max_drawdown(pnl, capital=100.0) == pytest.approx(-0.05)
+
+
+def test_deployed_notional_sums_overlapping_trades(surf):
+    """A daily-entry book holds `tenor` trades at once. That, not the per-trade
+    notional, is the capital at risk."""
+    engine.use_costs(Costs.zero())
+    s = Structure(legs=(Leg(+1, 0.10, -1.0, 10),), delta_hedge=True,
+                  notional=1_000_000.0, label="t")
+    trades = [engine.run_trade(surf, d, s) for d in surf.dates[100:160]]
+    trades = [t for t in trades if t]
+    live = engine.deployed_notional(trades, surf.dates)
+
+    # Warm-up aside, a 10-calendar-day hold entered every business day is ~7
+    # business days of overlap, so the book runs several times one trade.
+    assert live.max() > 3 * s.notional
+    assert live.max() == pytest.approx(
+        max(sum(t.notional for t in trades if t.entry <= d <= t.exit) for d in surf.dates)
+    )
+    # Nothing live before the first entry or after the last exit.
+    assert live.loc[live.index < trades[0].entry].eq(0).all()
+
+
+def test_drawdown_on_per_trade_notional_overstates_it(surf):
+    """The bug this guards: dividing by the per-trade notional instead of the
+    deployed book reported a -8.6% drawdown where the real figure was ~-1.2%."""
+    engine.use_costs(Costs.zero())
+    s = Structure(legs=(Leg(+1, 0.10, -1.0, 10),), delta_hedge=True,
+                  notional=1_000_000.0, label="t")
+    trades = [engine.run_trade(surf, d, s) for d in surf.dates[100:200]]
+    trades = [t for t in trades if t]
+    daily = engine.to_daily_pnl(trades, surf.dates)
+    live = engine.deployed_notional(trades, surf.dates)
+
+    flat = metrics.max_drawdown(daily, s.notional)
+    real = metrics.max_drawdown(daily, live)
+    assert real > flat                      # both negative; flat is the deeper
+    assert abs(flat / real) == pytest.approx(live.max() / s.notional, rel=1e-9)
+
+
+def test_summary_reports_the_base_it_used(surf):
+    """If a drawdown is quoted, the denominator has to be visible next to it."""
+    engine.use_costs(Costs.zero())
+    s = Structure(legs=(Leg(+1, 0.10, -1.0, 10),), delta_hedge=True, label="t")
+    trades = [t for t in (engine.run_trade(surf, d, s) for d in surf.dates[100:150]) if t]
+    daily = engine.to_daily_pnl(trades, surf.dates)
+    live = engine.deployed_notional(trades, surf.dates)
+
+    out = metrics.summary(daily, live, engine.run_schedule(surf, surf.dates[100:105], s))
+    assert out["peak_deployed"] == pytest.approx(live.max())
+    assert 0 < out["avg_deployed"] <= out["peak_deployed"]
+    assert "peak_deployed" not in metrics.summary(daily, 1_000_000.0)
+
+
+def test_capital_base_rejects_an_empty_series():
+    with pytest.raises(ValueError):
+        metrics.capital_base(pd.Series([0.0, 0.0]))

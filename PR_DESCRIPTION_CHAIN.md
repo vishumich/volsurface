@@ -63,6 +63,11 @@ Idea #1, 10DTE 5-delta SPX calls entered daily and delta-hedged at close, 2017-0
 | paid half-spread (vol pts) | - | 0.250 | **0.136** |
 | total costs | - | $137,955 | **$90,204** |
 | cost drag (% of gross) | - | 27.1% | 17.7% |
+| max drawdown | -0.95% | -1.00% | **-1.01%** |
+
+Drawdown is on the MEASURED capital base - `engine.deployed_notional`, peak $9.0mm, because a
+10DTE book entered daily holds ~9 trades at once. Against a published -1.04% that is a near-exact
+match, and it also tells us the report quotes drawdown on notional, which we had been guessing at.
 
 **It survives.** The strategy clears JPM's published pre-cost Sharpe *after* paying real quoted
 spreads, which their number excludes. The execution ladder says the same thing - 1.056 at mid,
@@ -75,9 +80,11 @@ Two caveats on that, both real:
   impact: crossing the half-spread is assumed to fill the whole clip. At the $1mm default notional
   that is fine (SPX's $100 multiplier makes it ~1.3 contracts against OI in the tens), but it stops
   being fine two orders of magnitude up, and the cost numbers here should be read as a floor.
-- **Drawdown still uses the wrong capital base.** -8.6% is on $1mm against a book running ~7
-  overlapping trades; on peak deployed it is nearer -1.2%, against JPM's -1.04%. The engine should
-  report deployed notional so this stops being arithmetic done by hand - see reviewer question 4.
+- **Returns look small once the base is honest.** 4.35% on $1mm becomes 0.48% on the $9.0mm the
+  book actually deploys. Deployed notional is not the same thing as capital employed - a
+  delta-hedged short wing ties up margin, not notional - so this understates return on capital as
+  badly as the old base overstated drawdown. Sharpe is unaffected either way, which is why it is
+  the number to compare on.
 
 ## What it refuses to do
 
@@ -179,8 +186,8 @@ the size behind it could not absorb the clip, so the cost figures are a lower bo
    will not tie out to anything else quoting OM's IV. Worth a reconciliation column?
 3. `max_delta_error=0.03` and the OTM-mid marking convention are both judgement calls. Sanity-check
    them against how the desk actually marks a wing.
-4. `max_drawdown` divides by a capital base the caller supplies, and every drawdown above is on a
-   flat $1mm, which is wrong for an overlapping daily-entry book. Should `TradeResult` aggregation
-   emit a deployed-notional series so the right denominator is available rather than estimated?
+4. Drawdown is now on deployed NOTIONAL, which matched the report to 0.03pp - but notional is not
+   capital employed. What base does the desk want for a margin-funded overlay: notional, initial
+   margin, or allocated capital? Whichever it is, `engine.deployed_notional` is the hook.
 5. Idea #1 clears its costs at the $1mm notional tested. At what size does it stop? That needs the
    depth model above, and it is the question that decides whether this is tradeable or merely true.

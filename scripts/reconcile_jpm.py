@@ -83,18 +83,32 @@ def idea2(conn, secid):
     print(f"\nrunning {dates[0].date()} -> {dates[-1].date()} ({len(dates):,} entry dates)")
 
     engine.use_costs(Costs.zero())
+
+    # ONE base for every stage, and it is the FUTURES leg's deployed notional.
+    # Measured rather than assumed - but a per-stage base would be worse than
+    # the flat $1mm it replaces: the premcap and final stages deploy 2.4-3.3x
+    # the benchmark, so dividing each by its own notional would show the call
+    # spread "cutting drawdown by 71%" when most of that is just a bigger
+    # denominator. The claim under test is call-spread VERSUS futures for the
+    # same equity exposure, so both sides must share the benchmark's base.
+    fut_trades, _, _ = cs_replacement.build(surface, dates, stage="futures")
+    base = engine.deployed_notional(fut_trades, dates)
+    print(f"common capital base = futures leg peak deployed ${base.max():,.0f}")
+
     out, rows = {}, []
     for stage in cs_replacement.STAGES:
         t0 = time.time()
         trades, daily, _ = cs_replacement.build(surface, dates, stage=stage)
-        out[stage] = (daily, CAPITAL, trades)
-        s = metrics.summary(daily, CAPITAL, trades)
+        live = engine.deployed_notional(trades, dates)
+        out[stage] = (daily, base, trades)
+        s = metrics.summary(daily, base, trades)
+        s["peak_deployed"] = float(live.max())     # this stage's OWN leverage
         tgt = JPM_IDEA2.get(stage)
         rows.append({
             "stage": stage, "trades": len(trades),
             "sharpe": s["sharpe"], "jpm_sharpe": tgt["sharpe"] if tgt else None,
             "max_dd": s["max_dd"], "jpm_max_dd": tgt["max_dd"] if tgt else None,
-            "ann_return": s["ann_return"],
+            "ann_return": s["ann_return"], "peak_deployed": s["peak_deployed"],
         })
         _t(f"{stage}: {len(trades):,} trades", t0)
 
@@ -156,12 +170,12 @@ def idea1(conn, secid, start=START, max_dte=18, band=0.09):
             "entry_delta": trades["entry_delta"].mean(),
             "tenor_d": trades["tenor_days"].mean(),
             "paid_vol_pts": trades["half_spread_vol_points"].mean(),
-            **metrics.summary(daily, CAPITAL, trades),
+            **metrics.summary(daily, engine.deployed_notional(trades, dates), trades),
         }
         _t(f"{label}: {len(trades):,} trades", t0)
 
     print("\n--- Idea #1 base, 10DTE 5-delta calls daily (JPM: Sharpe ~0.91, DD -1.04%) ---")
-    keep = ["trades", "entry_delta", "tenor_d", "paid_vol_pts",
+    keep = ["trades", "entry_delta", "tenor_d", "paid_vol_pts", "peak_deployed",
             "sharpe", "ann_return", "ann_vol", "max_dd", "total_costs", "cost_drag_pct_of_gross"]
     print(pd.DataFrame(rows).reindex(keep).to_string())
 
@@ -169,7 +183,8 @@ def idea1(conn, secid, start=START, max_dte=18, band=0.09):
     print(sensitivity.quoted_cost_ladder(
         run=lambda: upside_carry.build(cs, dates, overlays=False),
         set_mult=lambda m: engine.use_costs(Costs(spot_bps=0.5, quoted_spread_mult=m)),
-        capital=CAPITAL,
+        capital=engine.deployed_notional(
+            upside_carry.build(cs, dates, overlays=False)[0], dates),
     )[["sharpe", "ann_return", "max_dd", "total_costs", "paid_vol_points"]])
     engine.use_costs(Costs())
     return rows

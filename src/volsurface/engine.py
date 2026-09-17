@@ -106,6 +106,11 @@ class TradeResult:
     entry_delta: float = float("nan")
     tenor_days: int = 0
     half_spread_vol_points: float = float("nan")
+    # Notional actually put to work (after any premium-cap rescaling), so the
+    # drawdown denominator can be MEASURED rather than assumed. A daily-entry
+    # book holds `tenor` trades at once, so a flat per-trade notional is not
+    # the capital at risk and dividing by it overstates drawdown several-fold.
+    notional: float = 0.0
 
 
 class _NoListing(Exception):
@@ -282,6 +287,7 @@ def run_trade(surface, entry_date: pd.Timestamp, struct: Structure) -> TradeResu
         ])),
         tenor_days=int(min(dte for _, _, _, dte in struck)),
         half_spread_vol_points=float(np.mean(paid)) if paid else 0.0,
+        notional=float(struct.notional * scale),
     )
 
 
@@ -319,6 +325,7 @@ def run_schedule(surface, entries, struct: Structure, sizer=None) -> pd.DataFram
                 "entry_premium": r.entry_premium, "entry_vol": r.entry_vol, "scale": r.scale,
                 "entry_delta": r.entry_delta, "tenor_days": r.tenor_days,
                 "half_spread_vol_points": r.half_spread_vol_points,
+                "notional": r.notional,
             }
             for r in rows
         ]
@@ -339,3 +346,35 @@ def to_daily_pnl(trades: list[TradeResult], dates: pd.DatetimeIndex) -> pd.Serie
             inc.iloc[0] = t.daily.iloc[0]
         total = total.add(inc.reindex(dates).fillna(0.0), fill_value=0.0)
     return total
+
+
+def deployed_notional(trades, dates: pd.DatetimeIndex) -> pd.Series:
+    """Notional live on each date, summed across overlapping trades.
+
+    Takes either a list of `TradeResult` or a trades DataFrame carrying
+    `entry`/`exit`/`notional` - the futures benchmark builds its rows directly
+    and never produces TradeResults, so a list-only signature would quietly
+    exclude the one leg most in need of the correct denominator.
+
+    This is the drawdown denominator. These strategies enter EVERY day and hold
+    to expiry, so a book whose Structure says $1mm per trade is running roughly
+    `tenor` times that once it is warmed up - and dividing a drawdown by the
+    per-trade figure overstates it by exactly that factor. Measured on the
+    10DTE wing book it is ~7x, which is the difference between reporting -8.6%
+    and -1.2%.
+
+    Pass the result (or its `.max()`) to `metrics.max_drawdown` instead of a
+    hand-computed constant.
+    """
+    live = pd.Series(0.0, index=pd.DatetimeIndex(dates))
+    if isinstance(trades, pd.DataFrame):
+        if trades.empty or "notional" not in trades:
+            return live
+        rows = zip(trades["entry"], trades["exit"], trades["notional"])
+    else:
+        rows = ((t.entry, t.exit, t.notional) for t in trades)
+    for entry, exit_, notional in rows:
+        if not notional:
+            continue
+        live.loc[(live.index >= entry) & (live.index <= exit_)] += float(notional)
+    return live

@@ -12,7 +12,7 @@ are most likely to break.
 
 ```bash
 pip install -e .
-pytest                       # 34 unit tests, no vendor data needed
+pytest                       # 38 unit tests, no vendor data needed
 python scripts/run_smoke.py  # end-to-end on a synthetic surface
 ```
 
@@ -65,28 +65,30 @@ and the sensitivity harness are unchanged. Three things stop being assumptions.
 
 **1. Cost is measured, not guessed.** `Costs.vol_points` is one number standing in for a spread
 that is constant neither across the surface nor through time. Measured on real SPX quotes
-(2022-01-03 to 2026-09-14, 6.66M surviving quotes):
+(2017-01-03 to 2026-09-14, the paper's window, 4.69M surviving quotes):
 
 | delta bucket | median half-spread | p90 | median (ask−bid)/mid |
 |---|---|---|---|
-| 0–5 | **0.18 vol pts** | **0.84** | 13.3% |
-| 5–10 | 0.08 | 0.13 | 3.6% |
-| 10–25 | 0.06 | 0.11 | 2.0% |
-| 25–50 | 0.06 | 0.11 | 1.1% |
+| 0–5 | **0.25 vol pts** | **0.88** | 20.0% |
+| 5–10 | 0.10 | 0.20 | 5.0% |
+| 10–25 | 0.08 | 0.18 | 2.8% |
+| 25–50 | 0.08 | 0.19 | 1.4% |
 
-The 0.25 default is *conservative* at the median and far too generous in the tail: at 5 delta the
-median is 0.18 but the p90 is 0.84. The distribution's tail is the risk, not its centre — wing
-spreads widen precisely when a short-wing book would want to stop selling, and a constant charge
-cannot express that. Use `spread_profile()` on your own window rather than trusting either number.
+The 0.25 default is a good estimate of the 5-delta *bucket* (median 0.2547) and a bad model of what
+this *trade* pays (0.1362) — a daily 10DTE wing selects the most liquid listed strike near its
+target, at the tight end of its own bucket, so a bucket-calibrated flat charge overcharges it by
+53%. The p90 of 0.88 is the other half: spreads widen precisely when a short-wing book would want
+to stop selling, and a constant expresses neither. Measure with `spread_profile()` on the window
+you intend to trade — 2022–2026 alone gives 0.18, a benign-period artefact.
 
 **2. Strikes are listed strikes.** `strike_for_delta` snaps to the nearest quoted strike instead of
 solving for a continuous one, and `TradeResult.entry_delta` reports what you actually got. On real
-SPX the selection is tight: a "5-delta" book comes in at a mean 0.0503 delta over 1,172 trades. Ask for a
+SPX the selection is tight: a "5-delta" book comes in at a mean 0.0502 delta over 2,414 trades. Ask for a
 delta nothing is listed near and the day is skipped, not approximated — `Structure.max_delta_error`.
 
 **3. Expiries are listed expiries.** `resolve_tenor` snaps to a real expiry and returns its true DTE,
 which the engine then carries through the mark and the holding period. On real SPX a "10DTE" book
-averages 9.92 days, and only 1 of 1,173 entry dates had no usable listing. Set `Structure.tenor_tolerance_days` to skip days when nothing was listed near the target
+averages 9.85 days over the full 2017-2026 window. Set `Structure.tenor_tolerance_days` to skip days when nothing was listed near the target
 rather than silently trading a 17-day option as if it were a 10-day one — this is the control that
 stops a pre-2022 backtest inventing a weekly grid.
 
@@ -132,9 +134,9 @@ enhancements so you're not tuning overlays to rescue a strategy that costs alrea
 
 **2b. Re-run step 2 on the chain.** `cost_ladder` sweeps an assumption; once `opprcd` is loaded the
 spread is a measurement, so switch to `sensitivity.quoted_cost_ladder` and read
-`cs.spread_profile()` first. On SPX 2022-2026 the 5-delta median came in at 0.18 vol points, BELOW
-the 0.25 default, with a p90 of 0.84 - so the assumption is conservative typically and generous in
-the tail, and it is the tail that matters. If Idea #1 needs `spread_mult` below 0.5 it needs
+`cs.spread_profile()` first. On SPX 2017-2026 the 5-delta median is 0.25 vol points - the default
+is well calibrated to the bucket - but the trade itself pays 0.136, and the p90 is 0.88. So the
+flat charge is simultaneously too high for this trade and too low for a bad day. If Idea #1 needs `spread_mult` below 0.5 it needs
 better-than-mid fills every day at 5 delta, and the conversation moves to the execution desk. Check the skip rate here too: a large
 count of days with no listed 10DTE expiry, or no strike within `max_delta_error` of 5 delta, means
 the earlier standardised-surface run was trading options that did not exist.
@@ -173,8 +175,15 @@ construction, it isn't a vol-surface result.
 - Sharpe is computed on the **daily aggregated** series, not per-trade, because these strategies
   enter every day and hold to expiry, so up to `tenor` trades are live at once. Summing trade P&L
   understates drawdown.
-- `max_drawdown(daily, capital)` divides by a **capital base you supply**. For a daily-entry
-  overlapping book, pass peak deployed notional, not $1mm, or the figure will exceed 100%.
+- `max_drawdown(daily, capital)` takes a float **or** the `engine.deployed_notional` series - pass
+  the series. A daily-entry book holds ~`tenor` trades at once (measured: 9x for the 10DTE wing
+  book, 1.05x for the 1M futures benchmark), and dividing by one trade's notional overstates
+  drawdown by exactly that factor. It reported -8.6% where the real figure is -1.01%.
+  `summary` then reports `peak_deployed` next to the drawdown so the base is never in doubt.
+- **Comparing strategies needs ONE base across all of them.** Giving each stage its own deployed
+  notional makes the stage table meaningless - a 2.4x-levered stage looks like it cut drawdown when
+  it only enlarged the denominator. `reconcile_jpm.py` uses the futures benchmark's base for every
+  Idea #2 stage, because the claim under test is call-spread versus futures at the same exposure.
 - Costs are **on by default** (`Costs(vol_points=0.25, spot_bps=0.5)`). `Costs.zero()` reproduces
   the paper. On a surface that can quote (`chain.OptionChainSurface`) the **real half-spread is
   charged and `vol_points` is ignored**; `Costs.assumed(...)` forces the flat model back on for an

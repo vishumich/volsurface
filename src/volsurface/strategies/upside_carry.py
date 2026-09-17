@@ -116,7 +116,8 @@ def _as_frame(results):
              "option_pnl": r.option_pnl, "hedge_pnl": r.hedge_pnl, "cost": r.cost,
              "entry_vol": r.entry_vol, "entry_delta": r.entry_delta,
              "tenor_days": r.tenor_days,
-             "half_spread_vol_points": r.half_spread_vol_points}
+             "half_spread_vol_points": r.half_spread_vol_points,
+             "notional": r.notional}
             for r in results
         ]
     )
