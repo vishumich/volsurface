@@ -31,14 +31,34 @@ from . import blackscholes as bs
 
 @dataclass(frozen=True)
 class Costs:
-    """Half-spreads paid on entry and exit."""
+    """Half-spreads paid on entry and exit.
+
+    `vol_points` is the ASSUMED option half-spread, used when the surface cannot
+    quote - which is the only option on the standardised OptionMetrics surface.
+    When the surface implements `quote()` (see `chain.OptionChainSurface`) the
+    real quoted half-spread is charged instead and `vol_points` is ignored;
+    `quoted_spread_mult` scales it, so 1.0 means paying the quoted market, 0.5
+    means getting filled halfway to mid, and 2.0 means paying through.
+
+    Set `quoted_spread_mult=None` to force the assumed model even on a quoted
+    surface. That is what makes an apples-to-apples comparison against the
+    standardised-surface run possible.
+    """
 
     vol_points: float = 0.25   # vol points of option half-spread, e.g. 0.25 = 0.25 vol
     spot_bps: float = 0.5      # bps of notional per unit of hedge turnover
+    quoted_spread_mult: float | None = 1.0
 
     @staticmethod
     def zero() -> "Costs":
-        return Costs(0.0, 0.0)
+        # quoted_spread_mult=None matters: "costs off" has to mean off on a
+        # quoted surface too, not "charge whatever the chain quoted".
+        return Costs(0.0, 0.0, quoted_spread_mult=None)
+
+    @staticmethod
+    def assumed(vol_points: float = 0.25, spot_bps: float = 0.5) -> "Costs":
+        """Ignore quotes even where they exist, and charge a flat half-spread."""
+        return Costs(vol_points, spot_bps, quoted_spread_mult=None)
 
 
 @dataclass(frozen=True)
@@ -58,6 +78,12 @@ class Structure:
     premium_cap: float | None = None  # cap net premium as a % of notional; rescales qty
     unwind_at_days: int | None = None # early unwind with this many days left
     label: str = "trade"
+    # Only meaningful on a surface that resolves listed expiries/strikes.
+    # tenor_tolerance_days=None takes whatever expiry is nearest, however far;
+    # set it (e.g. 2) to skip days when no weekly near the target tenor existed,
+    # instead of quietly substituting a 17-day option for a 10-day one.
+    tenor_tolerance_days: int | None = None
+    max_delta_error: float = 0.03     # skip if no listed strike is this close
 
 
 @dataclass
@@ -73,23 +99,56 @@ class TradeResult:
     entry_vol: float
     scale: float
     daily: pd.Series = field(repr=False, default_factory=pd.Series)
+    # Realised, not requested. On a listed chain these drift away from the
+    # Structure's targets and the gap is the whole point of reading the chain:
+    # `entry_delta` says which strike you really got, `tenor_days` which expiry,
+    # `half_spread_vol_points` what the market really charged.
+    entry_delta: float = float("nan")
+    tenor_days: int = 0
+    half_spread_vol_points: float = float("nan")
 
 
-def _fixed_strikes(surface, date, legs):
+class _NoListing(Exception):
+    """The chain had no expiry or strike we could actually have traded that day."""
+
+
+def _fixed_strikes(surface, date, legs, tenor_tol=None, max_delta_error=0.03):
+    """Resolve each leg to (leg, strike, entry_vol, days_to_expiry).
+
+    Both resolution steps defer to the surface when it can answer:
+
+      resolve_tenor      a listed expiry, whose true DTE is usually not the
+                         requested tenor. Carrying it is what lets the mark and
+                         the holding period run to the real expiry.
+      strike_for_delta   a listed strike. Absent, solve for a continuous one on
+                         the surface - exact, but not a strike anyone could
+                         have traded.
+    """
+    resolve = getattr(surface, "resolve_tenor", None)
+    select = getattr(surface, "strike_for_delta", None)
     out = []
     for leg in legs:
-        T = leg.tenor_days / 365.0
-        F = surface.forward(date, T)
-        K = bs.strike_from_delta(F, T, leg.target_delta, leg.cp, lambda K: surface.iv(date, K, T))
-        out.append((leg, K, surface.iv(date, K, T)))
+        dte = leg.tenor_days if resolve is None else resolve(date, leg.tenor_days, tenor_tol)
+        if dte is None or dte <= 0:
+            raise _NoListing(f"no listed expiry near {leg.tenor_days}d on {date}")
+        T = dte / 365.0
+        if select is None:
+            F = surface.forward(date, T)
+            K = bs.strike_from_delta(
+                F, T, leg.target_delta, leg.cp, lambda K: surface.iv(date, K, T)
+            )
+        else:
+            K = select(date, T, leg.target_delta, leg.cp, max_delta_error)
+        out.append((leg, K, surface.iv(date, K, T), dte))
     return out
 
 
 def _mark(surface, date, struck, entry_date):
     """Value the structure and return (value, net_delta) per 1.0 of structure."""
     value, net_delta = 0.0, 0.0
-    for leg, K, _ in struck:
-        T = max((leg.tenor_days - (date - entry_date).days) / 365.0, 1e-8)
+    elapsed = (date - entry_date).days
+    for leg, K, _, dte in struck:
+        T = max((dte - elapsed) / 365.0, 1e-8)
         F = surface.forward(date, T)
         df = surface.discount(date, T)
         sig = surface.iv(date, K, T)
@@ -98,18 +157,46 @@ def _mark(surface, date, struck, entry_date):
     return value, net_delta
 
 
+def _option_cost(surface, date, leg, K, sig, dte, units):
+    """Cost of crossing one leg, in dollars. Real quote if there is one.
+
+    Returns (dollars, effective_half_spread_in_vol_points). The second value is
+    the diagnostic worth keeping: it is what the flat `Costs.vol_points` is
+    trying to guess, measured.
+    """
+    T = max(dte / 365.0, 1e-8)
+
+    mult = struct_costs.quoted_spread_mult
+    if mult is not None:
+        getq = getattr(surface, "quote", None)
+        q = None if getq is None else getq(date, K, T, leg.cp)
+        if q is not None:
+            return abs(leg.qty) * q.half_spread * mult * units, q.half_spread_vol_points * mult
+
+    # No quote available: fall back to the assumed vol half-spread through vega.
+    v = float(bs.vega(surface.forward(date, T), K, T, sig, surface.discount(date, T)))
+    return abs(leg.qty) * v * (struct_costs.vol_points / 100.0) * units, struct_costs.vol_points
+
+
 def run_trade(surface, entry_date: pd.Timestamp, struct: Structure) -> TradeResult | None:
     """Simulate one structure from entry to exit. Returns None if it cannot be struck."""
     dates = surface.dates
     if entry_date not in dates:
         return None
     try:
-        struck = _fixed_strikes(surface, entry_date, struct.legs)
-    except (RuntimeError, KeyError, ValueError):
+        struck = _fixed_strikes(
+            surface, entry_date, struct.legs,
+            struct.tenor_tolerance_days, struct.max_delta_error,
+        )
+    except (RuntimeError, KeyError, ValueError, _NoListing):
         return None
 
     S0 = surface.spot(entry_date)
-    min_tenor = min(l.tenor_days for l in struct.legs)
+    # Holding period is measured in CALENDAR days against the resolved expiry,
+    # not in rows of the business-date index. Those differ by ~40%, so counting
+    # rows held a 10-day option four calendar days past expiry and kept
+    # delta-hedging it at intrinsic.
+    min_tenor = min(dte for _, _, _, dte in struck)
     horizon = struct.hold_days if struct.hold_days is not None else min_tenor
     if struct.unwind_at_days is not None:
         horizon = min(horizon, min_tenor - struct.unwind_at_days)
@@ -125,16 +212,17 @@ def run_trade(surface, entry_date: pd.Timestamp, struct: Structure) -> TradeResu
         scale = min(1.0, cap_dollars / abs(entry_value)) if abs(entry_value) > cap_dollars else 1.0
     units = struct.notional / S0 * scale
 
-    # Entry cost: vol half-spread valued through vega, plus spot cost on the initial hedge.
+    # Entry cost: quoted half-spread where the chain has one, otherwise the
+    # assumed vol half-spread through vega. Plus spot cost on the initial hedge.
     cost = 0.0
-    for leg, K, sig in struck:
-        T = leg.tenor_days / 365.0
-        F = surface.forward(entry_date, T)
-        v = float(bs.vega(F, K, T, sig, surface.discount(entry_date, T)))
-        cost += abs(leg.qty) * v * (struct_costs.vol_points / 100.0) * units
+    paid = []
+    for leg, K, sig, dte in struck:
+        c, vp = _option_cost(surface, entry_date, leg, K, sig, dte, units)
+        cost += c
+        paid.append(vp)
 
-    idx = dates.searchsorted(entry_date)
-    path = dates[idx : idx + horizon + 1]
+    last_day = entry_date + pd.Timedelta(days=int(horizon))
+    path = dates[(dates >= entry_date) & (dates <= last_day)]
     if len(path) < 2:
         return None
 
@@ -163,12 +251,14 @@ def run_trade(surface, entry_date: pd.Timestamp, struct: Structure) -> TradeResu
     # Exit cost on the option legs (waived if held to expiry - it settles).
     held_to_expiry = struct.unwind_at_days is None and struct.hold_days is None
     if not held_to_expiry:
-        for leg, K, _ in struck:
-            T = max((leg.tenor_days - (path[-1] - entry_date).days) / 365.0, 1e-8)
-            F = surface.forward(path[-1], T)
+        elapsed = (path[-1] - entry_date).days
+        for leg, K, _, dte in struck:
+            left = max(dte - elapsed, 0)
+            T = max(left / 365.0, 1e-8)
             sig = surface.iv(path[-1], K, T)
-            v = float(bs.vega(F, K, T, sig, surface.discount(path[-1], T)))
-            cost += abs(leg.qty) * v * (struct_costs.vol_points / 100.0) * units
+            c, vp = _option_cost(surface, path[-1], leg, K, sig, left, units)
+            cost += c
+            paid.append(vp)
 
     total = option_pnl + hedge_pnl - cost
     return TradeResult(
@@ -180,9 +270,18 @@ def run_trade(surface, entry_date: pd.Timestamp, struct: Structure) -> TradeResu
         hedge_pnl=hedge_pnl,
         cost=cost,
         entry_premium=entry_value * units,
-        entry_vol=float(np.mean([s for _, _, s in struck])),
+        entry_vol=float(np.mean([s for _, _, s, _ in struck])),
         scale=scale,
         daily=pd.Series(daily, dtype=float),
+        entry_delta=float(np.mean([
+            abs(float(bs.delta(
+                surface.forward(entry_date, dte / 365.0), K, dte / 365.0, sig, leg.cp,
+                surface.discount(entry_date, dte / 365.0),
+            )))
+            for leg, K, sig, dte in struck
+        ])),
+        tenor_days=int(min(dte for _, _, _, dte in struck)),
+        half_spread_vol_points=float(np.mean(paid)) if paid else 0.0,
     )
 
 
@@ -218,6 +317,8 @@ def run_schedule(surface, entries, struct: Structure, sizer=None) -> pd.DataFram
                 "entry": r.entry, "exit": r.exit, "label": r.label, "pnl": r.pnl,
                 "option_pnl": r.option_pnl, "hedge_pnl": r.hedge_pnl, "cost": r.cost,
                 "entry_premium": r.entry_premium, "entry_vol": r.entry_vol, "scale": r.scale,
+                "entry_delta": r.entry_delta, "tenor_days": r.tenor_days,
+                "half_spread_vol_points": r.half_spread_vol_points,
             }
             for r in rows
         ]

@@ -18,7 +18,7 @@ import pandas as pd
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from volsurface import data, engine, metrics, sensitivity  # noqa: E402
+from volsurface import chain, data, engine, metrics, sensitivity  # noqa: E402
 from volsurface.engine import Costs  # noqa: E402
 from volsurface.strategies import cs_replacement, upside_carry  # noqa: E402
 
@@ -75,6 +75,80 @@ def main():
         out[stage] = (d, CAPITAL, t)
     print(metrics.summary_table(out)[["sharpe", "ann_return", "max_dd", "var95"]])
     print("\n(synthetic surface => no risk premium => these are plumbing checks, not results)")
+
+    chain_section()
+
+
+def chain_section():
+    """Same strategy, standardised surface vs a quoted chain.
+
+    The comparison is the deliverable. Everything that moves between the two
+    columns is something the standardised surface was quietly assuming.
+    """
+    print("\n" + "=" * 78)
+    print("FULL-CHAIN ADAPTER  standardised surface vs quoted chain")
+    print("=" * 78)
+
+    surf = data.make_synthetic(n_days=250, seed=11)
+    raw = chain.make_synthetic_chain(
+        surf, dates=surf.dates, strike_step=10.0, band=0.10, max_dte=100,
+    )
+    prices = pd.DataFrame({"date": surf.dates, "close": [surf.spot(d) for d in surf.dates]})
+    cs = chain.OptionChainSurface(raw, prices, rates=surf.r, divs=surf.q)
+    print(f"chain: {len(raw):,} rows in, {len(cs.quotes):,} quotes survived filtering")
+
+    print("\nWhat the chain actually charges (the 0.25 vol-point default is a guess):")
+    print(cs.spread_profile()[["n", "median_vol_points", "p90_vol_points", "median_rel_spread"]])
+
+    dates = cs.dates[60:-40]
+
+    engine.use_costs(Costs.zero())
+    cont_t, cont_d, _ = upside_carry.build(surf, dates, overlays=False)
+    chain_t, chain_d, _ = upside_carry.build(cs, dates, overlays=False)
+
+    print("\nStrike and expiry discretisation, costs OFF on both sides:")
+    print(pd.DataFrame({
+        "standardised": {
+            "trades": len(cont_t),
+            "mean entry delta": cont_t["entry_delta"].mean(),
+            "mean tenor (d)": cont_t["tenor_days"].mean(),
+            "sharpe": metrics.sharpe(cont_d),
+        },
+        "quoted chain": {
+            "trades": len(chain_t),
+            "mean entry delta": chain_t["entry_delta"].mean(),
+            "mean tenor (d)": chain_t["tenor_days"].mean(),
+            "sharpe": metrics.sharpe(chain_d),
+        },
+    }))
+    print(f"days the chain could not strike a 5-delta wing: "
+          f"{len(dates) - len(chain_t)}/{len(dates)}")
+
+    print("\nCosts ON: assumed 0.25 vol points vs the quoted market")
+    engine.use_costs(Costs.assumed(0.25, 0.5))
+    ass_t, ass_d, _ = upside_carry.build(cs, dates, overlays=False)
+    engine.use_costs(Costs(spot_bps=0.5, quoted_spread_mult=1.0))
+    qt_t, qt_d, _ = upside_carry.build(cs, dates, overlays=False)
+    print(pd.DataFrame({
+        "assumed 0.25vp": {
+            "half-spread paid (vp)": ass_t["half_spread_vol_points"].mean(),
+            "total cost": ass_t["cost"].sum(),
+            "sharpe": metrics.sharpe(ass_d),
+        },
+        "quoted": {
+            "half-spread paid (vp)": qt_t["half_spread_vol_points"].mean(),
+            "total cost": qt_t["cost"].sum(),
+            "sharpe": metrics.sharpe(qt_d),
+        },
+    }))
+
+    print("\nExecution ladder - how much of the quoted spread must you avoid paying?")
+    print(sensitivity.quoted_cost_ladder(
+        run=lambda: upside_carry.build(cs, dates, overlays=False),
+        set_mult=lambda m: engine.use_costs(Costs(spot_bps=0.5, quoted_spread_mult=m)),
+        capital=CAPITAL,
+    )[["sharpe", "ann_return", "max_dd", "total_costs", "paid_vol_points"]])
+    engine.use_costs(Costs())
 
 
 if __name__ == "__main__":

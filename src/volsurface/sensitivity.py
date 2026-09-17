@@ -115,6 +115,11 @@ def cost_ladder(
     Answers the question the report leaves open: at what bid-ask does each
     strategy stop working? Daily-rolled 5-delta structures with daily hedging
     are the most cost-sensitive thing in the paper.
+
+    Only meaningful on a surface that cannot quote. On a chain the engine
+    charges the real spread and ignores `vol_points`, so this ladder comes back
+    flat unless `set_costs` builds its `Costs` with `quoted_spread_mult=None`
+    (i.e. `Costs.assumed`). Use `quoted_cost_ladder` there instead.
     """
     rows = []
     for vp in vol_points:
@@ -122,3 +127,33 @@ def cost_ladder(
         trades, daily, _ = run()
         rows.append({"vol_points": vp, **metrics.summary(daily, capital, trades)})
     return pd.DataFrame(rows).set_index("vol_points")
+
+
+def quoted_cost_ladder(
+    run: Callable[[], tuple[pd.DataFrame, pd.Series, object]],
+    set_mult: Callable[[float], None],
+    mults=(0.0, 0.25, 0.5, 0.75, 1.0, 1.5),
+    capital: float = 1_000_000.0,
+) -> pd.DataFrame:
+    """`cost_ladder`'s counterpart for a quoted chain.
+
+    On the standardised surface the only question you can ask is "at what
+    assumed bid-ask does this die", because there is no quote to compare to.
+    Once the chain is wired in, the spread is a measurement and the open
+    question becomes execution: how much of the quoted spread do you have to
+    avoid paying for the strategy to work.
+
+    `mult=1.0` is lifting the offer / hitting the bid. `0.5` is mid. `0.0` is
+    the report's no-cost assumption. If a strategy needs `mult < 0.5` it is
+    claiming to get filled better than mid on a daily roll of thousands of
+    wing contracts, which is a claim about the desk, not about the surface.
+    """
+    rows = []
+    for m in mults:
+        set_mult(m)
+        trades, daily, _ = run()
+        row = {"spread_mult": m, **metrics.summary(daily, capital, trades)}
+        if "half_spread_vol_points" in getattr(trades, "columns", []):
+            row["paid_vol_points"] = float(trades["half_spread_vol_points"].mean())
+        rows.append(row)
+    return pd.DataFrame(rows).set_index("spread_mult")
